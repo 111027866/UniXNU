@@ -314,3 +314,28 @@ jobs:
         run: |
           rm -rf out/ipsw out/feeds device/.cache/firmware out/*/tree/.cache/firmware out/*/payload/data-skip-setup-* out/*/*/*/tree/.cache/firmware out/*/*/*/payload/data-skip-setup-*
           rm -f "$RUNNER_TEMP/trustcache" "$RUNNER_TEMP/data.dbr" "$RUNNER_TEMP/data-grow.dbr"
+
+
+      - name: Compress build images
+        if: success()
+        env:
+          WORK: ${{ steps.check.outputs.work }}
+        run: |
+          echo "=== Checking generated artifacts in $WORK ==="
+          find "$WORK" -maxdepth 3 -type f \( -name "*.img" -o -name "*.macho" -o -name "*.bin" \) -exec ls -lh {} +
+          mkdir -p "$RUNNER_TEMP/release-images"
+          # 使用 zstd 多线程快速压缩所有生成的 .img 镜像（含 boot.img 和 userdata.img），大幅减小体积并加快下载
+          find "$WORK" -maxdepth 3 -name "*.img" -print0 | while IFS= read -r -d '' img; do
+            base=$(basename "$img")
+            zstd -T0 -6 "$img" -o "$RUNNER_TEMP/release-images/${base}.zst"
+          done
+          ls -lh "$RUNNER_TEMP/release-images"
+
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-${{ steps.check.outputs.board }}-images-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-images/*.img.zst
+          if-no-files-found: warn
+          retention-days: 3
