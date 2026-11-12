@@ -1,0 +1,227 @@
+name: iPadOS 27 package
+
+# Full iPadOS 27 (24A446) package for sheng: boot.img from the device packaging flow, and the
+# userdata-root.img that iPadOS 27 boots from, with the .vroot block-hash tables the defconfig reads.
+#
+# Job boot       boot.img, payload.img, kernel.macho, the manifest and the first-install Data seed.
+#                The platform seed comes from the repository secret UNIXNU_UNIQUE_CHIP_ID.
+# Job userdata   OS + SystemOS windows of the IPSW behind SHNGROOT, plus OS.vroot/SystemOS.vroot.
+#
+# Flash the result to the macOS partition (or any partition whose LBAs match board.toml [userdata]):
+#   fastboot boot boot.img
+#   fastboot flash <partition> userdata-root.img
+#
+# The artifacts derive from Apple software: download them, then delete the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      init_data:
+        description: "FIRST installation: create a new iPadOS Data seed"
+        type: boolean
+        default: true
+      userdata:
+        description: "Also build userdata-root.img (about 15.7 GB, needed once for a first installation)"
+        type: boolean
+        default: true
+      boot_runner:
+        description: "Runner for the boot job"
+        type: choice
+        options: ["macos-26", "macos-15", "macos-14", "macos-latest", "self-hosted"]
+        default: "macos-26"
+      userdata_runner:
+        description: "Runner for the userdata job"
+        type: choice
+        options: ["macos-26", "macos-15", "macos-14", "macos-latest", "self-hosted"]
+        default: "macos-26"
+
+permissions:
+  contents: read
+
+env:
+  OS_PROFILE: ipados-27.0.1-24A446
+  # out/<board>/<os profile>/<defconfig without _defconfig> from board.toml [package.defconfig].
+  WORK: ${{ github.workspace }}/UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+defaults:
+  run:
+    # bash -eo pipefail: the package step's tee must not hide a failed build.
+    shell: bash
+
+jobs:
+  boot:
+    runs-on: ${{ inputs.boot_runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Check out UniXNU
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: UniXNU
+
+      - name: Check out the device repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: 111027866/UniXNU-sheng
+          ref: main
+          path: device
+          submodules: recursive
+
+      - name: Check out uefi-sheng
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: UniXNU/uefi-sheng
+          path: uefi-sheng
+          submodules: recursive
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: disk space
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          # The Android SDK is not used by this build and takes several GB.
+          rm -rf "$HOME/Library/Android" || true
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: tools
+        run: |
+          brew tap blacktop/tap
+          brew trust blacktop/tap || true
+          brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf zstd
+          brew install --formula blacktop/tap/ipsw
+          export PATH="/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/bison/bin:$PATH"
+          {
+            echo "/opt/homebrew/opt/llvm/bin"
+            echo "/opt/homebrew/opt/lld/bin"
+            echo "/opt/homebrew/opt/bison/bin"
+          } >> "$GITHUB_PATH"
+          ok=1
+          for t in clang xcodebuild make git ninja cmake dtc fdtget fdtput aea compression_tool \
+                   mformat mcopy ipsw hdiutil zstd; do
+            command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
+          done
+          for t in lld-link llvm-lib llvm-rc llvm-nm llvm-objcopy; do
+            [ -f "/opt/homebrew/opt/llvm/bin/$t" ] || [ -f "/opt/homebrew/opt/lld/bin/$t" ] || { echo "missing tool: $t"; ok=0; }
+          done
+          [ "$ok" = 1 ]
+
+      - name: platform seed
+        env:
+          seed: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          if ! [[ "$seed" =~ ^[0-9a-fA-F]{8}$ ]]; then
+            echo 'Set the repository secret UNIXNU_UNIQUE_CHIP_ID: the platform seed of the device, 8 hex digits.' >&2
+            exit 1
+          fi
+
+      - name: package
+        working-directory: device
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          args=(--os "$OS_PROFILE" --uefi ../uefi-sheng)
+          if [ "${{ inputs.init_data }}" = "true" ]; then args+=(--init-data); fi
+          scripts/package.sh "${args[@]}"
+
+      - name: images
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ipados27-boot
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            ${{ env.WORK }}/boot/boot.img
+            ${{ env.WORK }}/payload/payload.img
+            ${{ env.WORK }}/kernel/kernel.macho
+            ${{ env.WORK }}/package.manifest.json
+
+      - name: installation seed backup
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ipados27-seed
+          retention-days: 3
+          if-no-files-found: warn
+          path: |
+            ${{ env.WORK }}/runtime/data.dbr
+            ${{ env.WORK }}/runtime/inputs.json
+
+      - name: remove proprietary inputs
+        if: always()
+        run: |
+          rm -rf UniXNU/out/ipsw UniXNU/out/feeds device/.cache/firmware
+          rm -rf UniXNU/out/*/tree/.cache/firmware
+
+  userdata:
+    if: inputs.userdata
+    runs-on: ${{ inputs.userdata_runner }}
+    timeout-minutes: 240
+    steps:
+      - name: Check out UniXNU
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: UniXNU
+
+      - name: Check out the device repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: 111027866/UniXNU-sheng
+          ref: main
+          path: device
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: disk space
+        run: |
+          rm -rf "$HOME/Library/Android" || true
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: tools
+        run: |
+          brew tap blacktop/tap
+          brew trust blacktop/tap || true
+          brew install --formula blacktop/tap/ipsw
+          brew install zstd
+          for t in aea ipsw hdiutil zstd; do
+            command -v "$t" >/dev/null || { echo "missing tool: $t"; exit 1; }
+          done
+
+      - name: userdata image
+        working-directory: UniXNU
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./unixnu build userdata -D ../device --os "$OS_PROFILE" --dry-run
+          ./unixnu build userdata -D ../device --os "$OS_PROFILE"
+          python3 ../device/scripts/add-userdata-vroot.py "$WORK/userdata/userdata-root.img"
+          # The decrypted and encrypted disk images are no longer needed.
+          rm -rf out/ipsw
+          cat "$WORK/userdata/userdata-root.json"
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: compress
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-images"
+          zstd -T0 -6 "$WORK/userdata/userdata-root.img" -o "$RUNNER_TEMP/release-images/userdata-root.img.zst"
+          cp "$WORK/userdata/userdata-root.json" "$RUNNER_TEMP/release-images/"
+          ls -lh "$RUNNER_TEMP/release-images"
+
+      - name: userdata artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ipados27-userdata
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/release-images/userdata-root.img.zst
+            ${{ runner.temp }}/release-images/userdata-root.json
+
+      - name: remove proprietary inputs
+        if: always()
+        run: rm -rf UniXNU/out
